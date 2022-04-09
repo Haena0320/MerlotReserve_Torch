@@ -1,0 +1,60 @@
+data:
+  fft_hop_length: 588
+  fft_window_size: 1536
+  lang_seq_len: 144
+  mask_rate: 0.25
+  num_answers: 4
+  num_audio2text_seqs: 1
+  num_audio_subsegments: 3
+  num_mels: 64
+  num_segment_groups: 2
+  num_segments: 16
+  num_text2audio_seqs: 1
+  num_text_seqs: 1
+  num_text_seqs_in_record: 1
+  num_text_spans_to_include: 48
+  num_train_files: 256
+  random_scale_max: 1.1
+  random_scale_min: 1.0
+  sample_rate: 22050
+  seq_len: 640
+  spec_size: 188
+  text_span_budget: 38
+  train_fns: '/mnt3/user8/vcr/data/ppd_data/vcr/train{:03d}of256.tfrecord'
+  use_audio_token_prob: 0.5
+
+device:
+  batch_size: 8
+  commit_every_nsteps: 50
+  iterations_per_loop: 26592
+  n_fns_per_cycle: 256
+  num_parallel_reads: 128
+  prefetch_size: 0
+  shuffle_buffer_size: 4096
+
+model:
+  audio_num_layers: 12
+  audio_patch_size: 2
+  audio_seq_length: 60
+  audio_token_length: 6
+  hidden_size: 768
+  joint_num_layers: 12
+  output_grid:
+  - 18
+  - 32
+  span_num_layers: 4
+  text_span_length: 15
+  use_bfloat16: true
+  vit_num_layers: 12
+  vit_patch_size: 16
+  vit_pooling_ratio: 2
+
+optimizer:
+  beta_2: 0.98
+  do_bias_correction: true
+  eps: 1.0e-06
+  learning_rate: 1.0e-05
+  num_train_steps: 132960
+  num_warmup_steps: 13296
+  use_bfloat16_adam: true
+  weight_decay_rate: 0.1
