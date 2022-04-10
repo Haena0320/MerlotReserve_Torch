@@ -1,5 +1,6 @@
 import torch
-
+import torchvision
+import torchvision.transforms as transforms
 def apply_with_random_selector(x, func, num_cases):
     sel = torch.rand([],dtype=torch.int32)
 
@@ -92,7 +93,10 @@ def cumulative_maximum_int(x):
     arange_x = torch.arange(0, N)
     valid = torch.greater_equal(arange_x[:, None], arange_x[None])
     x_tile = torch.where(valid, x_tile, torch.full([N, N], -2147483648).int())
-    return torch.max(x_tile, -1)[0]
+    try:
+        return torch.max(x_tile, -1)[0]
+    except: # phause segments...
+        return torch.zeros_like(x)
 
 
 def uniform_random_select(n, num_samples, sort_idx=True):
@@ -244,4 +248,12 @@ def batch_index_iterator(len_l, batch_size, skip_end=True):
     for b_start in range(0, iterate_until, batch_size):
         yield (b_start, min(b_start + batch_size, len_l))
 
-    
+def pad_to_fixed_size(data, pad_value, max_len=15):
+    new_d = []
+    for d in data:
+        pad_length = max_len - len(d)
+        if pad_length > 0:
+            new_d.append(torch.concat([d, torch.zeros(pad_length)], -1).int())
+        else:
+            new_d.append(d[:max_len])
+    return torch.stack(new_d)
