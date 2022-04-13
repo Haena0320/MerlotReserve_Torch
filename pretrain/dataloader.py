@@ -30,10 +30,44 @@ with warnings.catch_warnings():
 logger = tf.get_logger()
 encoder = get_encoder()
 
-segment_k2f = ['image/encoded', 'image/format', 'image/key/sha256','image/height','image/width','spectrogram/encoded',
+segment_k = ['image/encoded', 'image/format', 'image/key/sha256','image/height','image/width','spectrogram/encoded',
             'spectrogram/format', 'spectrogram/key/sha256','spectrogram/height','spectrogram/width','spectrogram/magic_number',
           'youtude_id','video_src_index','title','tags','description','meta','playback_speed','start_time','end_time','tok_ids',
             'tok_start_times','tok_end_times','random_text']
+
+segment_k2f = {
+    'image/encoded': tf.io.FixedLenFeature((), tf.string, default_value=''),
+    'image/format': tf.io.FixedLenFeature((), tf.string, default_value='jpeg'),
+    'image/key/sha256': tf.io.FixedLenFeature((), tf.string, default_value=''),
+    'image/height': tf.io.FixedLenFeature((), tf.int64, 1),
+    'image/width': tf.io.FixedLenFeature((), tf.int64, 1),
+
+    'spectrogram/encoded': tf.io.FixedLenFeature((), tf.string, default_value=''),
+    'spectrogram/format': tf.io.FixedLenFeature((), tf.string, default_value='jpeg'),
+    'spectrogram/key/sha256': tf.io.FixedLenFeature((), tf.string, default_value=''),
+    'spectrogram/height': tf.io.FixedLenFeature((), tf.int64, 1),
+    'spectrogram/width': tf.io.FixedLenFeature((), tf.int64, 1),
+    'spectrogram/magic_number': tf.io.FixedLenFeature((), tf.float32, 1),
+
+    'youtube_id': tf.io.FixedLenFeature((), tf.string, default_value=''),
+    'video_src_index': tf.io.FixedLenFeature((), tf.int64, 1),
+
+    'title': tf.io.VarLenFeature(tf.int64),
+    'tags': tf.io.VarLenFeature(tf.int64),
+    'description': tf.io.VarLenFeature(tf.int64),
+    'meta': tf.io.FixedLenFeature((), tf.string, default_value=''),
+
+    'playback_speed': tf.io.VarLenFeature(tf.int64),
+    'start_time': tf.io.FixedLenFeature((), tf.float32, 1),
+    'end_time': tf.io.FixedLenFeature((), tf.float32, 1),
+
+    'tok_ids': tf.io.VarLenFeature(tf.int64),
+    'tok_start_times': tf.io.VarLenFeature(tf.float32),
+    'tok_end_times': tf.io.VarLenFeature(tf.float32),
+    'random_text': tf.io.VarLenFeature(tf.int64),
+}
+
+
 
 #encoded_jpg = segment_list[0]["image/encoded"]
 def load_and_resize_img(encoded_jpg, config):
@@ -264,17 +298,17 @@ def convert_rawtext_into_fake_segments(tokens, desired_len, span_budget, use_v1_
         weights = [0.0210583 , 0.03984984, 0.06506665, 0.09467365, 0.12138153,
            0.13305461, 0.12973022, 0.11296043, 0.09024, 0.06730134,
            0.04789645, 0.03232633, 0.02123288, 0.01397406, 0.00925371]
-        print(f"rawtext stats v1 -- should be for yttemporal 180m , weight {weights}", flush=True)
+        #print(f"rawtext stats v1 -- should be for yttemporal 180m , weight {weights}", flush=True)
 
     else:
         weights = [0.03233136, 0.05236081, 0.08763368, 0.11757072, 0.13737426,
            0.13717706, 0.12541218, 0.10262764, 0.0771088 , 0.05364242,
            0.0342899 , 0.0203823 , 0.01177542, 0.00664939, 0.00366406]
-        print(f"rawtext stats v2 -- should be for ytmega, weight {weights}", flush=True)
+        #print(f"rawtext stats v2 -- should be for ytmega, weight {weights}", flush=True)
 
 
     ev = sum(i * w_i for i, w_i in enumerate(weights)) + 1
-    logging.info("mask weights ev={:.3f}, weights={}".format(ev, weights))
+    ##logging.info("mask weights ev={:.3f}, weights={}".format(ev, weights))
     # k masked tokens that cover an expected length of k * e
     # L - k non masked tokens
     # mask rate is then ek/(L-k+ek)
@@ -312,12 +346,32 @@ def filter_out_tokens_not_in_youtube(spans_i, token_is_valid_tf=None):
     return spans_i.__getvalues__()
 
 
+def _unsparsify(x):
+    if isinstance(x, tf.SparseTensor):# 희소행렬
+        x = x.values
+    if x.dtype == tf.int64:
+        x = tf.cast(x, dtype=tf.int32) # 새로운 자료형으로 변환
+    x = x.numpy()
+        
+    return x
+
 class MerlotDataset(Dataset):
     def __init__(self, config, fn, num_devices=None, is_training=True):
         self.config = deepcopy(config['data'])
         self.config.update(config['model'])
+        num_segments = self.config["num_segments"]
         
-        self.dataset= torch.load(fn)
+        #self.dataset= torch.load(fn)
+        dataset = tf.data.TFRecordDataset(fn)
+        records = list(dataset.map(lambda x:x))
+        keys_to_features = {f'c{i:02d}/{k}': v for i in range(num_segments) for k, v in segment_k2f.items()}
+        
+        self.dataset = []
+
+        for record in records:
+            parsed_features = tf.io.parse_single_example(record, keys_to_features)
+            parsed_features_ = {k: _unsparsify(v) for k, v in parsed_features.items()}
+            self.dataset.append(parsed_features_)
         
     def __getitem__(self, idx):
 
@@ -325,7 +379,7 @@ class MerlotDataset(Dataset):
         config = self.config
         num_segments = config['num_segments']
         record = self.dataset[idx]
-        segment_list = [{k: (record.pop(f'c{i:02d}/{k}') if f'c{i:02d}/{k}' in record else 1) for k in segment_k2f} for i in range(num_segments)]
+        segment_list = [{k: (record.pop(f'c{i:02d}/{k}') if f'c{i:02d}/{k}' in record else 1) for k in segment_k} for i in range(num_segments)]
         features = {}
 
         load_single_img = functools.partial(load_and_resize_img, config=config)
@@ -386,7 +440,11 @@ class MerlotDataset(Dataset):
 
         segment_idx = torch.concat(segment_idx, 0)
         values = flatten([x['tok_ids'] for x in segment_list])
-        tokens_ragged = RaggedTensor.from_value_rowids(values, segment_idx, num_audio_spans)
+        try:
+            tokens_ragged = RaggedTensor.from_value_rowids(values, segment_idx, num_audio_spans)
+        except:
+            print(values)
+            print(segment_idx)
         tok_centroids_vals = torch.concat(tok_centroids_all, 0)
         audio_start_end = torch.concat(audio_start_end_all, 0)
 
@@ -623,20 +681,20 @@ def handle_batch(batched_tensor, num_devices=None):
 
     batch_size_, num_segments_, num_audio_subsegments, audio_seq_length, num_mels = batch['audio_clips'].shape
     batch['audio_clips'] = batch['audio_clips'].reshape(shape_prefix + [num_segments * num_audio_subsegments * audio_seq_length,
-                                                               num_mels])
+                                                               num_mels]).type(torch.float32)
 
 
     batch_size, num_text_segments, span_len = batch["text_spans"].shape
-    batch["text_spans"] = batch["text_spans"].reshape(shape_prefix + [num_text_segments, span_len])
+    batch["text_spans"] = batch["text_spans"].reshape(shape_prefix + [num_text_segments, span_len]).type(torch.int32)
 
-    batch["video_src_index"] = batch["video_src_index"].reshape(shape_prefix + [num_segments])
+    batch["video_src_index"] = batch["video_src_index"].reshape(shape_prefix + [num_segments]).type(torch.int32)
 
     for k in ['text2audio', 'audio2text', 'audio_text_matching', 'random_text']:
         if k in batch:
             x_shape = batch[k].shape
             x2 = batch[k].reshape(shape_prefix + [int(np.prod(x_shape[1:-2])), x_shape[-2], 3])
-            batch[k] = x2[..., 0] # text ids 
-            batch[k + '/audio_ptr'] = x2[..., 1] # audio masking 
-            batch[k + '/text_ptr'] = x2[..., 2] # text masking 
+            batch[k] = x2[..., 0].type(torch.int32) # text ids 
+            batch[k + '/audio_ptr'] = x2[..., 1].type(torch.int32) # audio masking 
+            batch[k + '/text_ptr'] = x2[..., 2].type(torch.int32) # text masking 
     return batch
     

@@ -163,6 +163,7 @@ class RaggedTensor:
         
     @classmethod
     def from_value_rowids(cls, values, value_rowids, nrows):
+        values= flatten([r.tolist() for r in values])
         result = [[values[i] for i in range(len(values)) if value_rowids[i] == row] for row in range(nrows)]
         row_len = [len(i) for i in result]
         return RaggedTensor(result, nrows=nrows, row_len=row_len, value_rowids=value_rowids)
