@@ -2,6 +2,7 @@ from mreserve.models import *
 from mreserve.utils.lowercase_encoder import AUDIOSPAN, LTOVPOOL, PADDING, MASK, MASKAUDIO
 import torch 
 import numpy as np
+
 class MerlotReservePretrainer(MerlotReserve):
         
     def forward(self, batch):
@@ -211,7 +212,7 @@ class MerlotReservePretrainer(MerlotReserve):
 
         # before contrastive objective, make normalizeation
         for k in outputs:
-            temp_to_use = torch.exp(outputs[k].pop('log_scale') / 2.0)
+            temp_to_use = torch.exp((outputs[k].pop('log_scale') / 2.0) +1e-5)
             for k2 in 'xy':
                 outputs[k][k2] = unit_normalize(outputs[k][k2]) * temp_to_use
                 k2_extra = f'{k2}_extra'
@@ -268,11 +269,14 @@ def loss_fn_given_preds(preds):
             if f'{k2}_extra' in c_dict:
                 y = torch.concat([y, c_dict[f'{k2}_extra']])
             #y_allgather = torch.gather(y).reshape(-1, x.shape[-1])
+
             y_allgather = y
-            print(f"{c_type} {k1}->{k2} dot product sim:  shaped [{x.shape}] -> [{y_allgather.shape}", flush=True)
-            denom_logits = torch.einsum('lh,vh->lv', x, y_allgather)
+            # print(f"{c_type} {k1}->{k2} dot product sim:  shaped [{x.shape}] -> [{y_allgather.shape}", flush=True)
+            denom_logits = torch.einsum('lh,vh->lv', x, y)
             denom_lse = torch.logsumexp(denom_logits.float(), dim=-1)
-            loss_info[c_type] += (denom_lse - numer_logits).mean() / 2.0
+            denom_lse = (denom_lse - numer_logits).mean() / 2.0
+
+            loss_info[c_type] += torch.clamp(denom_lse, 1e-6)
             if '_sources' in c_dict:
                 for i, type_i in enumerate(['text2audio', 'audio2text', 'random_text']):
                     does_match = (c_dict['_sources'] == i).float()
