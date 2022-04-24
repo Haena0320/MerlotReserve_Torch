@@ -4,10 +4,11 @@ import numpy as np
 from typing import Any, Dict, Union, Optional
 import torch
 import math
-from models.utils.lowercase_encoder import AUDIOSPAN, LTOVPOOL, PADDING, MASK, MASKAUDIO, get_encoder, Tokenizer
+from mreserve.utils.lowercase_encoder import AUDIOSPAN, LTOVPOOL, PADDING, MASK, MASKAUDIO, get_encoder, Tokenizer
 from copy import deepcopy
 from dataclasses import dataclass
 from torch import nn
+
 # Turn this on if you run out of memory. it will slow things down tho
 DO_GRADIENT_CHECKPOINTING = False
 checkpoint_if_enabled = jax.checkpoint if DO_GRADIENT_CHECKPOINTING else lambda x: x
@@ -53,21 +54,30 @@ def multimodal_rotary_coords(h=None, w=None, segment_idx=None, token_idx=None, d
     :param dtype: final datatype
     :return: [B, L, 4] rotary coords
     """
+    try:
+        device = segment_idx.device
+    except:
+        device = token_idx.device
+
+    assert device is not None
     bs, ls = zip(*[x.shape for x in [h, w, segment_idx, token_idx] if x is not None])
     L = ls[0]
     B = bs[0]
     assert all([x == L for x in ls])
     assert all([x == B for x in bs])
-    # if (L > max_token):
-    #     print(f"WARNING: you passed in a sequence of length {L} but max_token is {max_token} so position "
-    #           f"embeddings might be weird. this is only a problem for text sequences though. "
-    #           f"in other words it shouldn't matter for downstream tasks")
 
     h_vec = torch.zeros([B, L], dtype=dtype) if (h is None) else h
     w_vec = torch.zeros([B, L], dtype=dtype) if (w is None) else w
     s_vec = torch.zeros([B, L], dtype=dtype) if (segment_idx is None) else segment_idx / max_segment
     t_vec = torch.zeros([B, L], dtype=dtype) if (token_idx is None) else token_idx / max_token
-    return torch.stack([h_vec, w_vec, s_vec, t_vec], -1)
+
+    h_vec = h_vec.to(device)
+    w_vec = w_vec.to(device)
+    s_vec = s_vec.to(device)
+    t_vec = t_vec.to(device)
+
+    result = torch.stack([h_vec, w_vec, s_vec, t_vec], -1)
+    return result
 
 
 def construct_rotary_sinusoids(coords, rotary_hsize: int = 32, max_freq=10.0, dtype=None):
@@ -81,17 +91,16 @@ def construct_rotary_sinusoids(coords, rotary_hsize: int = 32, max_freq=10.0, dt
              they are repeated accordingly
     """
     # Sanity check
+    device = coords.device
     batch_dims, seq_length, num_dims = coords.shape
     assert rotary_hsize % (num_dims * 2) == 0
     dim_expansion = rotary_hsize // (num_dims * 2)
     assert dim_expansion > 0
 
     freqs = torch.logspace(0.0, math.log2(max_freq / 2.0), dim_expansion, base=2,
-                         dtype=coords.dtype if dtype is None else dtype)
-    # for i in range(len(batch_dims) + 2):
-    #     freqs = freqs[None]
+                         dtype=coords.dtype if dtype is None else dtype).to(device)
 
-    radians = coords[..., None] * freqs * np.pi
+    radians = coords[..., None] * freqs * torch.pi
     radians = radians.reshape(batch_dims, seq_length, num_dims * dim_expansion)
     cos_t = torch.cos(radians)
     sin_t = torch.sin(radians)
@@ -114,8 +123,6 @@ def apply_rotary(query_key, sinusoids):
     batch_dims, seq_len, num_heads, size_per_head = query_key.shape
 
     assert rotary_hsize <= size_per_head
-    # for i in range(len(batch_dims) - len(sin_batch_dims)):
-    #     sinusoids = sinusoids[None]
 
     sin = sinusoids[..., 0, :, None, :]
     cos = sinusoids[..., 1, :, None, :]
@@ -127,76 +134,30 @@ def apply_rotary(query_key, sinusoids):
     query_key = torch.cat([qk_rope, query_key[..., rotary_hsize:]], -1)
     return query_key
 
-#
-# def kernel_init(key, shape, dtype=jnp.float32):
-#     """
-#     scaling by 0.02 works but for the last linear in the res mlp we often want to scale that down proportional
-#     to depth. size is [4H, H]
-#
-#     hsize to depth:
-#     [768 -> 12]   * 1/sqrt(12)
-#     [1536 -> 48]  * 1/sqrt(48)
-#
-#     so i.e.
-#     (6144, 1536) -> 0.02 / sqrt(48)
-#     (3072, 768) -> 0.02 / sqrt(12)
-#
-#     roughly an inverse linear relationship. so..
-#     scale = alpha / in_size
-#     3072 * 0.02 / sqrt(12)  = alpha ~ 18
-#
-#     because this is multimodal my network is \sqrt{2} deeper, i'll divide by an extra sqrt 2.
-#
-#     :param key:
-#     :param shape:
-#     :return:
-#     """
-#     #
-#     if len(shape) == 2:
-#         in_size = shape[-2]
-#     elif len(shape) == 3:
-#         # special case for how jax handled attention shards, etc.
-#         # e.g. for (768, 36, 64)   -> dimension is 768
-#                 #  (12, 64, 768)   -> dimension is also 768 (first two)
-#         in_size = shape[0]
-#         out_size = shape[2]
-#         if in_size < out_size:
-#             in_size *= shape[1]
-#     else:
-#         print(f"weird shape for kernel init {shape}")
-#         in_size = shape[-2]
-#
-#     stddev = min(18.0 / in_size, 0.02) / np.sqrt(2)
-#     return jax.random.truncated_normal(key, -2, 2, shape, dtype) * stddev
-# #
 
-def apply_attention(qk, sinusoids, head_size):
+def apply_attention(qk, sinusoids, attention_bias=None):
     q, k= qk
     query_key = torch.cat([q,k], dim=-2)
-    #query_key, value = torch.split(qkv, [2 * num_heads], dim=-2)
 
     if sinusoids is not None:
         query_key = apply_rotary(query_key, sinusoids)
-    print_model(query_key, 'apply_rotary_query_key')
+    #print_model(query_key, 'apply_rotary_query_key')
+
     query, key = query_key.chunk(2, dim=-2)
-    print_model(query, 'query aftr rotary')
-    print_model(key, 'key aftr rotary')
-
-    #query = query.permute(0, 2, 1, 3) # query : B, S_q, num_head, head_size -> B, num_head, S_q, head_size
-    #key = key.permute(0, 2, 1, 3) # key : B, S_k, num_head, head_size -> B, num_head, S_k, head_size
-
+    #print_model(query, 'query aftr rotary')
+    #print_model(key, 'key aftr rotary')
+    #print_model(attention_bias, 'attention_bias')
     query = query / math.sqrt(query.shape[-1])
-    #att_score = torch.matmul(query, key.transpose(-1, -2))
+
     att_score = torch.einsum('...qhd,...khd->...hqk', query, key)
+    if attention_bias is not None:
+        att_score = att_score + attention_bias
     att_probs = nn.functional.softmax(att_score, dim=-1)
-    # attention_probs = nn.attention.dot_product_attention_weights(query=query, key=key, bias=attention_bias,
-    #                                                              dtype=dtype)
-    #
+    #print_model(att_probs, 'att_probs')
+
     return att_probs
 
-# apply_attention_ckpt = jax.checkpoint(apply_attention)
-#
-#
+
 class AttentionLayer(nn.Module):
     """
     Attention layer that is somewhat simpler (since only need to do encoder->encoder attention). but with Rotary
@@ -207,15 +168,15 @@ class AttentionLayer(nn.Module):
         self.dtype = dtype
         self.hidden_size = hidden_size
         self.num_attention_head = self.hidden_size // self.size_per_head
-        self.query_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.key_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.value_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        self.attn_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.query_proj = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.key_proj = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.value_proj = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.attn_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False, dtype=self.dtype)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_head, self.size_per_head)
         x = x.view(*new_x_shape)
-        return x #.permute(0, 2, 1, 3)
+        return x
 
     def __call__(self, x, sinusoids=None, attention_bias=None):
         """
@@ -224,43 +185,22 @@ class AttentionLayer(nn.Module):
         :param sinusoids [*batch_dims, seq_len, rotary_hsize <= size_per_head // 2]. This is how we encode position
         :return:
         """
-        #print("{}: {}".format(self.name, 'NOT doing rotary ' if sinusoids is None else f'doing rotary: {sinusoids}'), flush=True)
-        #print("{}: ~{}doing attnmask~".format(self.name, 'NOT ' if attention_bias is None else ''), flush=True)
-        #batch_dims, seq_len, hidden_size = x.shape
-        #assert self.hidden_size % self.size_per_head == 0
 
         x_query = self.transpose_for_scores(self.query_proj(x)) # B S Nd Hs
         x_key = self.transpose_for_scores(self.key_proj(x))  # B S Nd Hs
         x_value = self.transpose_for_scores(self.value_proj(x)) # B S Nd Hs
 
-        print_model(x_query, 'x_query')
-        print_model(x_key, 'x_key')
-        print_model(x_value, 'x_value')
-        # qkv = nn.DenseGeneral(features=(3 * num_heads, self.size_per_head), axis=-1,
-        #                       dtype=self.dtype, kernel_init=kernel_init, name='qkv')(x)
-
-
-        #attn_fn = apply_attention_ckpt if (seq_len > 1024 and self.hidden_size >= 1024) else apply_attention
-        att_probs = apply_attention((x_query, x_key), sinusoids, self.size_per_head) # B, nh, S, hd
-
-        ####### NO DROPOUT???
-        if attention_bias is not None:
-            att_probs = att_probs * attention_bias
-        print_model(att_probs, 'att_probs') # B, nh,
+        att_probs = apply_attention((x_query, x_key), sinusoids, attention_bias) # B, nh, S, hd
 
         x_value = x_value.permute(0, 2, 1, 3) # B, S, nh, hs => B, nh, S, hs
-        print('!!!! att_probs shape', att_probs.shape)
-        print('!!!! x_value shape', x_value.shape)
+
         x = torch.matmul(att_probs, x_value)
         x = x.permute(0, 2, 1, 3).contiguous()
         new_x_shape = x.size()[:-2] + (self.hidden_size,)
         x = x.view(*new_x_shape)
 
-        print(x.shape)
-        #### end
         x = self.attn_proj(x)
-        # x = nn.DenseGeneral(features=self.hidden_size, axis=(-2, -1), kernel_init=kernel_init,
-        #                     dtype=self.dtype, name='attn_proj', use_bias=False)(x)
+
         return x
 
 
@@ -274,8 +214,10 @@ class MLPBlock(nn.Module):
         self.hidden_size = hidden_size
         self.dtype = dtype
         self.expansion_mult = expansion_mult
-        self.intermediate = nn.Linear(self.hidden_size, self.hidden_size * self.expansion_mult)
-        self.out = nn.Linear(self.hidden_size * self.expansion_mult, self.hidden_size, bias=False)
+        self.intermediate = nn.Linear(self.hidden_size, self.hidden_size * self.expansion_mult,
+                                      dtype=self.dtype)
+        self.out = nn.Linear(self.hidden_size * self.expansion_mult, self.hidden_size,
+                             bias=False, dtype=self.dtype)
 
     def forward(self, x):
         x1 = self.intermediate(x)
@@ -299,28 +241,39 @@ class TransformerLayer(nn.Module):
 
 
     def forward(self, x, sinusoids=None, attention_bias=None):
+        # batch_dims, seq_len, hsz = x.shape
+        #
+        # assert hsz == self.hidden_size
+        #
+        # x_ln = self.pre_attn_ln(x)
+        # x_attn = self.attention_layer(x_ln, sinusoids=sinusoids, attention_bias=attention_bias)
+        # x += x_attn
+        # x_ln2 = self.pre_mlp_ln(x)
+        # x_mlp = self.mlp_layer(x_ln2)
+        #
+        # x += x_mlp
+
         batch_dims, seq_len, hsz = x.shape
 
         assert hsz == self.hidden_size
-        print("Transformer layer my dtype={}; x={}; sinusoids={}".format(
-            self.dtype, (x.shape, x.dtype),
-            (sinusoids.dtype, sinusoids.shape) if sinusoids is not None else None), flush=True)
+
         x_ln = self.pre_attn_ln(x)
-        print_model(x_ln, 'after_pre_attn_ln')
+        #print_model(x_ln, 'after_pre_attn_ln')
 
         x_attn = self.attention_layer(x_ln, sinusoids=sinusoids, attention_bias=attention_bias)
-        print_model(x_attn, 'after_attention_layer')
+        #print_model(x_attn, 'after_attention_layer')
 
-        x += x_attn
+        hidden = x_attn + x
+        hidden_ln = self.pre_mlp_ln(hidden)
+        #print_model(hidden_ln, 'after_pre_mlp_ln')
 
-        x_ln2 = self.pre_mlp_ln(x)
-        print_model(x_ln2, 'after_pre_mlp_ln')
+        hidden_mlp = self.mlp_layer(hidden_ln)
+        #print_model(hidden_mlp, 'after_mlp_layer')
 
-        x_mlp = self.mlp_layer(x_ln2)
-        print_model(x_mlp, 'after_mlp_layer')
 
-        x += x_mlp
-        return x
+        hidden = hidden + hidden_mlp
+
+        return hidden
 
 class TransformerEncoder(nn.Module):
     """
@@ -328,7 +281,7 @@ class TransformerEncoder(nn.Module):
     """
 
     def __init__(self, hidden_size, num_layers, expansion_mult=4, size_per_head=64,
-                 dtype=torch.float32, add_cls_token=False, cls_output_size=None, rotary_hsize=32):
+                 dtype=torch.float32, add_cls_token=False, cls_output_size=None, rotary_hsize=32, logger=None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -338,15 +291,16 @@ class TransformerEncoder(nn.Module):
         self.add_cls_token = add_cls_token
         self.cls_output_size = cls_output_size
         self.rotary_hsize = rotary_hsize
-        #cls_token = self.param('cls', nn.initializers.normal(stddev=0.02), (self.hidden_size,))
-        self.cls = nn.Parameter(torch.normal(mean=0, std=0.02, size=(1, 1, self.hidden_size)))
-        self.cls_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        #self.pos_emb = nn.Parameter(torch.normal(mean=0, std=0.02, size=(1, seq_len, self.hidden_size)))
+        if add_cls_token:
+            self.cls = nn.Parameter(
+                torch.normal(mean=0, std=0.02, size=(1, 1, self.hidden_size), dtype=self.dtype))
+            self.cls_proj = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
         self.pre_ln = torch.nn.LayerNorm(normalized_shape=self.hidden_size, eps=1e-5, dtype=self.dtype)
         self.final_ln = torch.nn.LayerNorm(normalized_shape=self.hidden_size, eps=1e-5, dtype=self.dtype)
         self.transformer_layers = nn.ModuleList(
             [TransformerLayer(hidden_size=self.hidden_size, expansion_mult=self.expansion_mult,
                               size_per_head=self.size_per_head, dtype=self.dtype) for _ in range(self.num_layers)])
+
 
     def forward(self, x, rotary_coords=None, attention_mask=None, is_valid=None):
         """
@@ -359,6 +313,7 @@ class TransformerEncoder(nn.Module):
         :return:
         """
         batch_dims, seq_len, hsz = x.shape
+        device = x.device
         assert hsz == self.hidden_size
 
         # Add CLS token
@@ -367,19 +322,17 @@ class TransformerEncoder(nn.Module):
             if attention_mask is not None:
                 raise ValueError("Attention mask must not be provided if adding CLS token")
 
-            # for i in range(len(batch_dims) + 1):  # For sequence dimension, and batch dimensions
-            #     self.cls_token = self.cls_token[None]
+            #print_model(self.cls, 'cls_token')
             cls_token = torch.tile(self.cls, [batch_dims, 1, 1])
-            print_model(cls_token, 'cls_token')
 
             x = torch.cat([cls_token.to(x.dtype), x], -2)
             if is_valid is not None:
-                 is_valid = torch.cat([torch.ones(list(batch_dims) + [1], dtype=torch.bool), is_valid], -1)
+                 is_valid = torch.cat([torch.ones([batch_dims, 1], dtype=torch.bool).to(device), is_valid], -1)
 
             if rotary_coords is not None:
                 # CLS token is always 0's
                 rotary_coords = torch.cat([torch.zeros_like(rotary_coords[..., :1, :]), rotary_coords], -2)
-            print_model(rotary_coords, 'rotary_coords')
+            #print_model(rotary_coords, 'rotary_coords')
 
         # Optional rotary embeddings
         if rotary_coords is not None:
@@ -388,80 +341,73 @@ class TransformerEncoder(nn.Module):
             assert self.rotary_hsize is not None
             assert self.rotary_hsize <= self.size_per_head
             sinusoids = construct_rotary_sinusoids(rotary_coords, rotary_hsize=self.rotary_hsize)
-            print_model(sinusoids, 'sinusoids')
+            #print_model(sinusoids, 'sinusoids')
 
         else:
             sinusoids = None
-            print("ROTARY IS NONE SO PROVIDING PE", flush=True)
-            # pos_emb = self.param('pe', nn.initializers.normal(stddev=0.02), (seq_len, self.hidden_size))
-            # for i in range(len(batch_dims)):
-            #     pos_emb = pos_emb[None]
-            # x += self.pos_emb
 
         if (is_valid is not None) and (attention_mask is None):
-            print("Constructing the attention mask")
             attention_mask = is_valid[..., None] & is_valid[..., None, :]
         elif (is_valid is not None) and (attention_mask is not None):
             raise ValueError("Provide only one of `is_valid` and `attention_mask` "
                              "as we can use is_valid to construct attention mask")
+        #print_model(attention_mask, 'attention_mask')
 
         if attention_mask is not None: ## 문제 있을 수도 있음.
             # Broadcast attention mask to be over num head`s dimension
             attention_mask = attention_mask[..., None, :, :]
             attention_bias = (1 - (attention_mask * 1)) * -1e10
+            attention_bias = attention_bias.to(self.dtype)
         else:
             attention_bias = None
-        print_model(attention_bias, 'attention_bias')
+        #print_model(attention_bias, 'attention_bias')
 
         x = self.pre_ln(x)
-        print_model(x, 'after pre_ln')
+        #print_model(x, 'after pre_ln')
 
         for layer_output in self.transformer_layers:
             x = layer_output(x, sinusoids=sinusoids, attention_bias=attention_bias)
+
         x_ln = self.final_ln(x)
-        print_model(x_ln, 'after final_ln')
+        #print_model(x_ln, 'after final_ln')
 
         info = {}
         if self.add_cls_token:
             cls_vec = x_ln[..., 0, :]
             info['cls'] = self.cls_proj(cls_vec)
-            print_model(info['cls'], 'after_cls_proj')
             info['seq'] = x_ln[..., 1:, :]
-            print_model(info['seq'], 'info_seq')
         else:
             info['seq'] = x_ln
         return info
 
-def print_model(_param, name):
-    start_str = f'---- {name} ----'
-    print(start_str)
-    print(_param)
-    print('=' * len(start_str))
-
 
 class VisionTransformer(nn.Module):
-    def __init__(self, patch_size=16, hidden_size=768, size_per_head=64, dtype=torch.float32, num_layers=12,
-                 pooling_ratio=2, output_grid_h=12, output_grid_w=20, do_rotary=True):
+    def __init__(self, patch_size=16, hidden_size=768, size_per_head=64, num_layers=12, dtype=torch.float32,
+                 device='cpu', pooling_ratio=2, output_grid_h=12, output_grid_w=20, do_rotary=True, logger=None):
         super().__init__()
         self.patch_size = patch_size
         self.hidden_size = hidden_size
         self.size_per_head = size_per_head
         self.num_heads = self.hidden_size // self.size_per_head
         self.dtype = dtype
+        self.device = device
         self.num_layers = num_layers
         self.pooling_ratio = pooling_ratio
         self.output_grid_h = output_grid_h
         self.output_grid_w = output_grid_w
         self.do_rotary = do_rotary
 
-        self.embedding = nn.Linear(self.hidden_size, self.hidden_size)
+        self.embedding = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
         self.transformer = TransformerEncoder(hidden_size=self.hidden_size, dtype=self.dtype,
                                    add_cls_token=True, num_layers=self.num_layers, size_per_head=self.size_per_head)
-        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True)
-        # self.seq_q_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        # self.seq_k_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        # self.seq_v_proj = nn.Linear(self.hidden_size, self.hidden_size)
-        # self.seq_out_proj = nn.Linear(self.hidden_size, self.hidden_size)
+        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
+
+        if self.do_rotary:
+            self.coords = get_rotary_coordinates_2d(
+                self.output_grid_h, self.output_grid_w, dtype=self.dtype)
+            self.coords = self.coords.to(self.device)
+        else:
+            self.coords = None
 
     def forward(self, x):
         """
@@ -474,15 +420,15 @@ class VisionTransformer(nn.Module):
         assert pp3 == (self.patch_size ** 2) * 3
 
         # i think no need to normalize here because pixel distributions are roughly the same
-        x = self.embedding(x)
-        print_model(x, 'embedding')
+        x = self.embedding(x) # -- OK
+        #print_model(x, 'embedding')
 
         if self.do_rotary:
-            coords = get_rotary_coordinates_2d(self.output_grid_h, self.output_grid_w, dtype=self.dtype)
-            print_model(coords, 'coords')
-            coords = torch.tile(coords, [batch_dims, 1, 1])
+            #print_model(self.coords, 'coords')
+            coords = torch.tile(self.coords, [batch_dims, 1, 1])
         else:
             coords = None
+
         t_out = self.transformer(x, rotary_coords=coords)
 
         # Attention pool
@@ -497,44 +443,34 @@ class VisionTransformer(nn.Module):
         seq = seq.reshape([b2 * w2, self.pooling_ratio ** 2, self.hidden_size])
 
         inputs_q = seq.mean(-2, keepdims=True)
-        # seq_q = self.seq_q_proj(inputs_q)
-        # seq_k = self.seq_k_proj(seq)
-        # seq_v = self.seq_v_proj(seq)
 
         seq_attn_out, _  = self.seq_attnpool(inputs_q, seq, seq) ## 아마도 여기 문제 있을 수 있음.
-        # seq_attn_out = self.seq_out_proj(seq_attn_out)
 
         seq_attnpool = seq_attn_out.reshape([batch_dims, h2*w2, self.hidden_size])
-        # seq_attnpool = nn.MultiHeadDotProductAttention(num_heads=self.hidden_size // self.size_per_head, dtype=self.dtype,
-        #                                                deterministic=True,
-        #                                                name='seq_attnpool')(inputs_q=inputs_q, inputs_kv=seq)
-        # seq_attnpool = seq_attnpool.reshape(list(batch_dims) + [h2 * w2, self.hidden_size])
 
         t_out['seq_attnpool'] = seq_attnpool
         return t_out
-#
+
 
 class AudioTransformer(nn.Module):
-    def __init__(self, patch_size=2, hidden_size=768, dtype=torch.float32, num_layers=12, pooling_ratio=3, do_rotary=True, size_per_head=64):
+    def __init__(self, patch_size=2, hidden_size=768, dtype=torch.float32, device='cpu',
+                 num_layers=12, pooling_ratio=3, do_rotary=True, size_per_head=64, logger=None):
         super(AudioTransformer, self).__init__()
         self.patch_size: int = patch_size
         self.hidden_size: int = hidden_size
         self.dtype: Any = dtype
+        self.device = device
         self.size_per_head: int = size_per_head
         self.num_heads = self.hidden_size // self.size_per_head
         self.num_layers: int = num_layers
         self.pooling_ratio: int = pooling_ratio
         self.do_rotary: bool = do_rotary
 
-        self.embedding = nn.Conv2d(in_channels=3, out_channels=self.hidden_size,
-                                   kernel_size=(self.patch_size, self.patch_size),
-                                   stride=(self.patch_size, self.patch_size)) # 고쳐야 함.
+        self.embedding = torch.nn.Conv1d(in_channels=65, out_channels= 768, kernel_size=2, stride=2, dtype=self.dtype) # in_channels=audio_sequence_len,(need config matching)
+        self.transformer = TransformerEncoder(hidden_size=self.hidden_size, add_cls_token=True,
+                              num_layers=self.num_layers, size_per_head=self.size_per_head, dtype=self.dtype)
 
-        self.transformer = TransformerEncoder(hidden_size=self.hidden_size, dtype=self.dtype, add_cls_token=True,
-                                   num_layers=self.num_layers, size_per_head=self.size_per_head)
-
-        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True)
-
+        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
 
     def forward(self, x):
         """
@@ -545,11 +481,13 @@ class AudioTransformer(nn.Module):
         assert num_mels_plus_playback_speed == 65
         assert raw_len % self.patch_size == 0
         seq_len = raw_len // self.patch_size
-
+        x = x.transpose(-2,-1)
         x = self.embedding(x)
-
+        x = x.transpose(1,2)
         if self.do_rotary:
             coords = get_rotary_coordinates(seq_len, dtype=self.dtype, center_origin=True)[:, None] / seq_len
+            coords = coords.to(self.device)
+            coords = torch.tile(coords, [batch_dims, 1, 1])
         else:
             coords = None
 
@@ -558,29 +496,32 @@ class AudioTransformer(nn.Module):
         # Attention pool
         assert seq_len % self.pooling_ratio == 0
         l2 = seq_len // self.pooling_ratio
-        seq = jnp.reshape(t_out['seq'], [-1, self.pooling_ratio, self.hidden_size])
+        seq = torch.reshape(t_out['seq'], [-1, self.pooling_ratio, self.hidden_size])
 
         inputs_q = seq.mean(-2, keepdims=True)
 
         seq_attnpool, _  = self.seq_attnpool(inputs_q, seq, seq) ## 아마도 여기 문제 있을 수 있음.
 
-        seq_attnpool = seq_attnpool.reshape(list(batch_dims) + [l2, self.hidden_size])
+        seq_attnpool = seq_attnpool.reshape([batch_dims] + [l2, self.hidden_size])
         t_out['seq_attnpool'] = seq_attnpool
         return t_out
 
 
 class SpanTransformer(nn.Module):
-    def __init__(self, hidden_size=768, size_per_head=64, dtype=torch.float32, num_layers=3, max_len=16, do_rotary=True):
+    def __init__(self, hidden_size=768, size_per_head=64, dtype=torch.float32, device='cpu',
+                 num_layers=3, max_len=16, do_rotary=True, logger=None):
         super(SpanTransformer, self).__init__()
         self.hidden_size = hidden_size
         self.size_per_head = size_per_head
         self.dtype = dtype
+        self.device = device
         self.num_layers = num_layers
         self.max_len = max_len
         self.do_rotary = do_rotary
 
         self.transformer = TransformerEncoder(hidden_size=self.hidden_size, dtype=self.dtype,
                            add_cls_token=True, num_layers=self.num_layers, size_per_head=self.size_per_head)
+
 
     def forward(self, x, x_isvalid):
         """
@@ -590,10 +531,11 @@ class SpanTransformer(nn.Module):
         """
         batch_dims, seq_len, hidden_size = x.shape
         assert seq_len < self.max_len
-        # don't center bc many things are short
+
         if self.do_rotary:
-            coords = get_rotary_coordinates(
-                eq_len, center_origin=False, dtype=self.dtype)[:, None] / self.max_len
+            coords = get_rotary_coordinates(seq_len, center_origin=False, dtype=self.dtype)[:, None] / self.max_len
+            coords = coords.to(self.device)
+            coords = torch.tile(coords, [batch_dims, 1, 1])
         else:
             coords = None
         t_out = self.transformer(x, is_valid=x_isvalid, rotary_coords=coords)
@@ -601,7 +543,7 @@ class SpanTransformer(nn.Module):
 
 
 class TokenEmbedder(nn.Module):
-    def __init__(self, hidden_size, vocab_size=32768, dtype=torch.float32):
+    def __init__(self, hidden_size, vocab_size=32768, dtype=torch.float32, logger=None):
         super(TokenEmbedder, self).__init__()
         """
         Independently embed tokens
@@ -627,22 +569,7 @@ class TokenEmbedder(nn.Module):
         out_dict = dict()
         for key, val in token_dict.items():
             out_dict[key] = self.everything_embedded(val.to(torch.int32))
-        #
-        # keys = sorted(token_dict.keys())
-        # shapes = [token_dict[k].shape for k in keys]
-        # n_elems = [int(np.prod(y)) for y in shapes]
-        # x_flat = torch.cat([token_dict[k].reshape(-1) for k in keys], 0)
-        #
-        # embedded = self.everything_embedded(x_flat)
-        #
-        # # this seems to be needed becauase nn.Embed is a thin wrapper around the actual parameter
-        # # if self.dtype == jnp.bfloat16:
-        # #     everything_embedded = everything_embedded.astype(jnp.bfloat16)
-        # embed_split = torch.chunk(embedded, np.cumsum(n_elems), axis=0)
-        #
-        # out_dict = {}
-        # for i, (k_i, s_i, v_i) in enumerate(zip(keys, shapes, embed_split)):
-        #     out_dict[k_i] = v_i.reshape(list(s_i) + [self.hidden_size])
+
         return out_dict
 
 
@@ -668,34 +595,41 @@ def one_hot_pool(do_pool, idx, v, num_segments, real_bsize=None):
         idx = idx.reshape((real_bsize, l2))
         v = v.reshape((real_bsize, l2, H))
 
-    if do_pool:
-        pointer = idx
-    else:
-        pointer = torch.full(idx.shape, -1)
-    pointer_oh = torch.nn.one_hot(pointer, num_classes=num_segments, dtype=v.dtype)
+
+    pointer = torch.where(do_pool, idx.long(), torch.full(idx.shape, num_segments).long().cuda())
+    pointer_oh = torch.nn.functional.one_hot(pointer, num_classes=(num_segments+1))[:,:,:num_segments] * 1.0
 
     attended = torch.einsum('bls,blh->bsh', pointer_oh, v)
     return {'x': attended, 'idx_oh': pointer_oh}
 
 
-def unit_normalize(x):
+def unit_normalize(x, dtype=torch.float32):
     """
     Normalize `x` to have unit norm over the final dimension
     :param x:
     :return:
     """
-    x_f32 = x.to(torch.float32)
+
+    x_f32 = x.to(dtype)
     x_norm = x_f32 / torch.sqrt(torch.square(x_f32).sum(-1, keepdims=True) + 1e-5)
-    return x_norm.astype(x.dtype)
+    return x_norm.type(x.dtype)
 
 
 class MerlotReserve(nn.Module):
     config: Dict = None
 
-    def __init__(self, config):
+    # @classmethod
+    # def from_config(cls, config, **kwargs):
+    #     my_config = deepcopy(config["model"])
+    #     my_config.update(config['data'])
+    #     my_config["dtype"] = torch.float32
+    #     return cls(config=my_config, **kwargs)
+    
+    def __init__(self, config, logger, device):
         super().__init__()
         self.config = config
-
+        self.logger = logger
+        self.device = device
         for k, v in self.config.items():
             setattr(self, k, v)
 
@@ -709,7 +643,9 @@ class MerlotReserve(nn.Module):
                                                 output_grid_w=self.output_grid_w,
                                                 hidden_size=self.config['hidden_size'],
                                                 dtype=self.dtype,
+                                                device=self.device,
                                                 size_per_head=self.size_per_head,
+                                                logger=self.logger
                                                 )
         self.audio_encoder = AudioTransformer(num_layers=self.config['audio_num_layers'],
                                               patch_size=self.config['audio_patch_size'],
@@ -717,25 +653,31 @@ class MerlotReserve(nn.Module):
                                                   self.config['audio_token_length'] * self.config['audio_patch_size']),
                                               hidden_size=self.config['hidden_size'],
                                               dtype=self.dtype,
+                                              device=self.device,
                                               size_per_head=self.size_per_head,
+                                              logger=self.logger
                                               )
         self.token_encoder = TokenEmbedder(hidden_size=self.config['hidden_size'],
                                            dtype=self.dtype,
+                                           logger=self.logger
                                            )
         self.span_encoder = SpanTransformer(num_layers=self.config['span_num_layers'], hidden_size=self.hidden_size,
                                             dtype=self.dtype,
+                                            device=self.device,
                                             size_per_head=self.size_per_head,
+                                            logger=self.logger
                                             )
         self.joint_transformer = TransformerEncoder(hidden_size=self.config['hidden_size'],
                                                     num_layers=self.config['joint_num_layers'],
                                                     add_cls_token=False,
                                                     dtype=self.dtype,
                                                     size_per_head=self.size_per_head,
+                                                    logger=self.logger
                                                     )
 
-        self.joint_proj = nn.Linear(self.config['hidden_size'], self.config['hidden_size'])
+        self.joint_proj = nn.Linear(self.config['hidden_size'], self.config['hidden_size'], dtype=self.dtype)
 
-        self.scale_params = nn.Parameter(torch.ones(3,))
+        self.scale_params = nn.Parameter(torch.ones(3, dtype=self.dtype))
 
 
     def prepare_multimodal_inputs(self, tokens, token_segment_idx=None, token_embs=None, vision_input=None,
@@ -759,36 +701,55 @@ class MerlotReserve(nn.Module):
                  * Rotary embedding coords of size [B, seq_len, 4] (4 is the dimension we use)
                  * Attention mask of size [B, seq_len, seq_len]
         """
+        """
+        token_segment_idx [batch*2, 160]
+
+        tensor([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1,
+                1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+                2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+                4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6,
+                6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+
+        token_embs [batch*2, 160, 768]
+
+        vision_input [batch*2, 480, 768] == [B, vis_seq_len, H]
+
+
+        audio_spans [batch*2, 48, 6, 768] == [B, num_audio_seqs, audio_seq_length, H] 24을 48로 두배 증폭
+
+        audio_pointers [B, seq_len] 만약 seq_len 에서 [5]가 등장하면, text token 대신 오디오 span 을 인풋으로 함.
+
+        """
+        
+        
         B, L = tokens.shape
         if token_embs is None:
-            print("Constructing token embs in `prepare_multimodal_inputs`", flush=True)
             token_embs = self.token_encoder({'k': tokens})['k']
 
-        if (audio_spans is None) or (audio_pointers is None):
-            print("Not including audio input", flush=True)
-        else:
-            print("adding in audio input!")
+        if (audio_spans is not None) and (audio_pointers is not None):
             b_, num_audio_seqs, audio_token_length, h_ = audio_spans.shape
             assert b_ == B
             assert self.audio_token_length == audio_token_length
 
             is_audio_src = (tokens == AUDIOSPAN)
             assert tokens.shape == audio_pointers.shape
-            audio_ptr = torch.maximum(audio_pointers, 0)
+            audio_ptr = torch.maximum(audio_pointers, torch.tensor(0))
 
             # subtle weirdness -- this doesn't check that e.g. if you want span "0" 8 times, you're actually
             # putting that token there 8 times. So you can truncate the sequence, but you have to truncate at the end
-            audio_subpos = torch.maximum(torch.cumsum(is_audio_src.astype(jnp.int32), -1) - 1, 0) % self.audio_token_length
+            audio_subpos = torch.maximum(torch.cumsum(is_audio_src.int(), -1) - torch.tensor(1), torch.tensor(0)) % self.audio_token_length
 
-            audio_embs = audio_spans[torch.arange(B, dtype=jnp.int32)[:, None], audio_ptr, audio_subpos]
-            token_embs = lax.select(jnp.repeat(is_audio_src[..., None], self.hidden_size, axis=-1),
-                                    on_true=audio_embs, on_false=token_embs)
+            audio_embs = audio_spans[torch.arange(B)[:, None], audio_ptr.long(), audio_subpos.long()]
+            token_embs = torch.where(torch.repeat_interleave(is_audio_src[..., None], self.hidden_size, dim=-1),
+                                    audio_embs, token_embs)
 
-        token_idx = torch.tile(1.0 + torch.arange(L, dtype=self.dtype)[None], [B, 1])
+        token_idx = torch.tile(1.0 + torch.arange(L, dtype=self.dtype).to(self.device)[None], [B, 1])
         coords = multimodal_rotary_coords(
             segment_idx=token_segment_idx.to(self.dtype) if token_segment_idx is not None else None,
             token_idx=token_idx, dtype=self.dtype)
-
+        coords = coords.to(self.device)
         if vision_input is not None:
 
             hpool = self.output_grid_h // self.vit_pooling_ratio
@@ -798,9 +759,8 @@ class MerlotReserve(nn.Module):
             b_, vis_seq_len, h_ = vision_input.shape
             num_pool_segments = vis_seq_len // (hpool * wpool)
             img_coords = torch.tile(img_coords_pool, [num_pool_segments, 1])
-            vis_segment_idx = torch.arange(num_pool_segments, dtype=torch.int32).repeat(hpool * wpool)
-            print(f"Vision input {hpool}x{wpool}: {vis_seq_len}. num_pool_segments: {num_pool_segments}",
-                  flush=True)
+            vis_segment_idx = torch.arange(num_pool_segments).repeat(hpool * wpool).to(self.device)
+
             img_coords = torch.tile(img_coords[None], [B, 1, 1])
             vis_segment_idx = torch.tile(vis_segment_idx[None], [B, 1])
             img_mm_coords = multimodal_rotary_coords(segment_idx=vis_segment_idx.to(self.dtype),
@@ -815,33 +775,33 @@ class MerlotReserve(nn.Module):
         # Attention mask
         is_valid = (tokens != PADDING)
         if vis_seq_len > 0:
-            is_valid = torch.cat([is_valid, torch.ones([B, vis_seq_len], dtype=is_valid.dtype)], 1)
+            is_valid = torch.cat([is_valid, torch.ones([B, vis_seq_len], dtype=is_valid.dtype).to(self.device)], 1)
 
         # Pad everything if needed
         if padding_len is not None:
             extra_len = padding_len - is_valid.shape[1]
             assert extra_len >= 0
             if extra_len > 0:
-                print(f"Padding by {extra_len}", flush=True)
-                is_valid = torch.cat([is_valid, torch.zeros([B, extra_len], dtype=is_valid.dtype)], 1)
-                coords = torch.cat([coords, torch.zeros([B, extra_len, 4], dtype=coords.dtype)], 1)
+                is_valid = torch.cat([is_valid, torch.zeros([B, extra_len], dtype=is_valid.dtype).to(self.device)], 1)
+                coords = torch.cat([coords, torch.zeros([B, extra_len, 4], dtype=coords.dtype).to(self.device)], 1)
                 token_embs = torch.cat(
-                    [token_embs, torch.zeros([B, extra_len, self.hidden_size], dtype=token_embs.dtype)], 1)
+                    [token_embs, torch.zeros([B, extra_len, self.hidden_size], dtype=token_embs.dtype).to(self.device)], 1)
         else:
             extra_len = 0
 
-        attn_mask = is_valid[:, None] & is_valid[:, :, None]
+        attn_mask = is_valid[:, None] & is_valid[:, :, None] # 패딩 아닌 토큰 표시
 
         # Deal with the case where we packed multiple things together in a single seqence
+        # 하나의 시퀀스에서 여러 스판 마스킹 할 때, 
         if (video_src_idx is not None) and (token_segment_idx is not None):
-            print("Masking using video_src_idx to split up different videos in the same sequence", flush=True)
-            batch_indexer = torch.arange(B, dtype=torch.int32)[:, None]
-            video_src = [video_src_idx[batch_indexer, token_segment_idx]]
+            batch_indexer = torch.arange(B)[:, None].long()
+            batch_indexer = batch_indexer.to(self.device)
+            video_src = [video_src_idx[batch_indexer, token_segment_idx.long()]]
             if vis_segment_idx is not None:
                 video_src.append(video_src_idx[batch_indexer, vis_segment_idx])
             if extra_len > 0:
                 video_src.append(torch.full([B, extra_len], -1, dtype=torch.int32))
-            video_src = torch.concatenate(video_src, -1)
+            video_src = torch.concat(video_src, -1)
 
             attn_mask &= (video_src[:, None] == video_src[:, :, None])
 
@@ -861,7 +821,7 @@ class MerlotReserve(nn.Module):
         :return: [B, H] matrix of vectors (one per text span option)
         """
         token_embs = self.token_encoder({'text_spans': text_spans})['text_spans']
-        return unit_normalize(self.span_encoder(x=token_embs, x_isvalid=text_spans != PADDING))
+        return unit_normalize(self.span_encoder(x=token_embs, x_isvalid=text_spans != PADDING), dtype=self.dtype)
 
     def embed_audio_only(self, audio_clips):
         """
@@ -871,7 +831,7 @@ class MerlotReserve(nn.Module):
         """
         *batch_dims, num_hops_per_audio, num_mels_plus_one = audio_clips.shape
         audio_enc = self.audio_encoder(audio_clips.reshape((-1, self.audio_seq_length, 65)))['cls']
-        audio_enc = unit_normalize(audio_enc)
+        audio_enc = unit_normalize(audio_enc, dtype=self.dtype)
         return audio_enc.reshape(*batch_dims, self.hidden_size)
 
     def get_imgseq_only(self, imgs):
@@ -929,11 +889,11 @@ class MerlotReserve(nn.Module):
             audio_spans=audio_enc[None],
         )
         joint_enc = self.joint_transformer(**mm_inputs)['seq']
-        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]))
+        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]), dtype=self.dtype)
         return joint_enc
 
     def batch_embed_video(self, images, audio_clips, tokens, subseg_idxs):
-        return jax.vmap(self.embed_video)(images, audio_clips, tokens, subseg_idxs)
+        return self.embed_video(images, audio_clips, tokens, subseg_idxs)
 
     def embed_singleimg_with_multiimg_prompt(self, images_prompt, images, tokens, subseg_idxs):
         """
@@ -949,7 +909,7 @@ class MerlotReserve(nn.Module):
         ns1, num_patch_per_img, pp3 = images.shape
         assert (ns0 + ns1) <= 8
         imgs_enc = self.vision_encoder(images)['seq_attnpool']
-        imgs_enc = jnp.concatenate([images_prompt, imgs_enc], 0)
+        imgs_enc = torch.cat([images_prompt, imgs_enc], 0)
         imgs_enc = imgs_enc.reshape(((ns0 + ns1) * num_patch_per_img // 4, self.hidden_size))
 
         token_length, = tokens.shape
@@ -964,7 +924,7 @@ class MerlotReserve(nn.Module):
             audio_spans=None,
         )
         joint_enc = self.joint_transformer(**mm_inputs)['seq']
-        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]))
+        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]), dtype=self.dtype)
         return joint_enc
 
     def embed_preencoded_noaudio(self, images_enc, tokens, subseg_idxs):
@@ -977,7 +937,7 @@ class MerlotReserve(nn.Module):
         :return: a joint encoding of size [L, H], tokens conditioned on images.
         """
         ns, num_patch_per_img_div_4, hidden_size = images_enc.shape
-        images_enc = jnp.reshape(images_enc, [ns * num_patch_per_img_div_4, hidden_size])
+        images_enc = torch.reshape(images_enc, [ns * num_patch_per_img_div_4, hidden_size])
         token_length, = tokens.shape
         token_length_, = subseg_idxs.shape
         assert token_length_ == token_length
@@ -990,7 +950,7 @@ class MerlotReserve(nn.Module):
             audio_spans=None,
         )
         joint_enc = self.joint_transformer(**mm_inputs)['seq']
-        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]))
+        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]), dtype=self.dtype)
         return joint_enc
 
     def embed_preencoded_audio(self, images_enc, audio_enc, tokens, subseg_idxs, audio_pointers):
@@ -1006,7 +966,7 @@ class MerlotReserve(nn.Module):
         token_length_, = subseg_idxs.shape
         assert token_length_ == token_length
 
-        images_enc = jnp.reshape(images_enc, [-1, self.hidden_size])
+        images_enc = torch.reshape(images_enc, [-1, self.hidden_size])
 
         # Encode audio to be [num_audio_spans, 6, H]
         mm_inputs = self.prepare_multimodal_inputs(
@@ -1017,7 +977,8 @@ class MerlotReserve(nn.Module):
             audio_spans=audio_enc[None],
         )
         joint_enc = self.joint_transformer(**mm_inputs)['seq']
-        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]))
+        joint_enc = unit_normalize(self.joint_proj(joint_enc[0, :token_length]), dtype=self.dtype)
+
         return joint_enc
 
 
@@ -1154,3 +1115,24 @@ class PretrainedMerlotReserve:
         answer_table_enc = jnp.array([x.ids[:15] for x in self.encoder.encode_batch(options)])
         self.encoder.no_padding()
         return self.embed_text_spans_only(answer_table_enc)
+#
+# def #print_model(_param, name='none'):
+#     return
+#     start_str = f'---- {name} ----'
+#     print(start_str)
+#     try:
+#         if len(_param.shape) == 5:
+#             print(_param[0][0][0][0][:5], _param.shape)
+#         if len(_param.shape) == 4:
+#             print(_param[0][0][0][:5], _param.shape)
+#         elif len(_param.shape) == 3:
+#             print(_param[0][0][:5], _param.shape)
+#         elif len(_param.shape) == 2:
+#             print(_param[0][:5], _param.shape)
+#         elif len(_param.shape) == 1:
+#             print(_param[:5], _param.shape)
+#         else:
+#             print(_param, _param.shape)
+#     except:
+#         print(_param)
+#     print('=' * len(start_str))
