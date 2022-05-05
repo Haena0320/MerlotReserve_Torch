@@ -92,7 +92,7 @@ def construct_rotary_sinusoids(coords, rotary_hsize: int = 32, max_freq=10.0, dt
     """
     # Sanity check
     device = coords.device
-    batch_dims, seq_length, num_dims = coords.shape
+    *batch_dims, seq_length, num_dims = coords.shape
     assert rotary_hsize % (num_dims * 2) == 0
     dim_expansion = rotary_hsize // (num_dims * 2)
     assert dim_expansion > 0
@@ -100,16 +100,20 @@ def construct_rotary_sinusoids(coords, rotary_hsize: int = 32, max_freq=10.0, dt
     freqs = torch.logspace(0.0, math.log2(max_freq / 2.0), dim_expansion, base=2,
                          dtype=coords.dtype if dtype is None else dtype).to(device)
 
+    for i in range(len(batch_dims) + 2):
+        freqs = freqs[None]
+
     radians = coords[..., None] * freqs * torch.pi
-    radians = radians.reshape(batch_dims, seq_length, num_dims * dim_expansion)
+    radians = radians.reshape(*batch_dims, seq_length, num_dims * dim_expansion) # 8, 577, 16
     cos_t = torch.cos(radians)
     sin_t = torch.sin(radians)
-    sinusoids = torch.stack([cos_t, sin_t], -3)
+    sinusoids = torch.stack([cos_t, sin_t], -3) # torch.Size([8, 2, 577, 16])
+
     # Here we're repeating on the final dimension
     # bc later we will go through the first rotary_hsize coordinates and do
     # sin'd part: [-x0, x1, -x2, x3, ....]
     # cos'd part: [x0,  x1,  x2, x3, ....]
-    sinusoids = sinusoids.repeat([1, 1, 1, 2])
+    sinusoids = torch.repeat_interleave(sinusoids, 2, dim=-1)#[1, 1, 1, 2])
     return sinusoids
 #
 #
@@ -141,19 +145,28 @@ def apply_attention(qk, sinusoids, attention_bias=None):
 
     if sinusoids is not None:
         query_key = apply_rotary(query_key, sinusoids)
-    #print_model(query_key, 'apply_rotary_query_key')
+    print_model(query_key, 'apply_rotary_query_key')
 
     query, key = query_key.chunk(2, dim=-2)
-    #print_model(query, 'query aftr rotary')
-    #print_model(key, 'key aftr rotary')
-    #print_model(attention_bias, 'attention_bias')
-    query = query / math.sqrt(query.shape[-1])
+    print_model(query, 'query aftr rotary') # Batch  Seq  H_Num  H_Size
+    print_model(key, 'key aftr rotary') # Batch  Seq  H_Num  H_Size
+    print_model(attention_bias, 'attention_bias') # Batch  Seq  H_Num  H_Size
 
-    att_score = torch.einsum('...qhd,...khd->...hqk', query, key)
+    ## -- flax style
+    depth = query.shape[-1]
+    query = query / math.sqrt(depth)
+    #attn_weights = torch.einsum('...qhd,...khd->...hqk', query, key)
+
+    ## -- torch style
+    query = query.permute(0, 2, 1, 3)
+    key = key.permute(0, 2, 3, 1)
+    attn_weights = torch.matmul(query, key)
+    #attn_weights = query_key / math.sqrt(64)
+    #att_score = att_score / math.sqrt(query.shape[-1])
     if attention_bias is not None:
-        att_score = att_score + attention_bias
-    att_probs = nn.functional.softmax(att_score, dim=-1)
-    #print_model(att_probs, 'att_probs')
+        attn_weights = attn_weights + attention_bias
+    att_probs = nn.functional.softmax(attn_weights, dim=-1)
+    print_model(att_probs , 'att_probs') # Batch Head_Num Seq Seq
 
     return att_probs
 
@@ -185,19 +198,21 @@ class AttentionLayer(nn.Module):
         :param sinusoids [*batch_dims, seq_len, rotary_hsize <= size_per_head // 2]. This is how we encode position
         :return:
         """
+        # x : B, S, Hs
+        x_query = self.transpose_for_scores(self.query_proj(x)) # B S nh Hs
+        x_key = self.transpose_for_scores(self.key_proj(x))  # B S nh Hs
+        x_value = self.transpose_for_scores(self.value_proj(x)) # B S nh Hs
 
-        x_query = self.transpose_for_scores(self.query_proj(x)) # B S Nd Hs
-        x_key = self.transpose_for_scores(self.key_proj(x))  # B S Nd Hs
-        x_value = self.transpose_for_scores(self.value_proj(x)) # B S Nd Hs
+        att_probs = apply_attention((x_query, x_key), sinusoids, attention_bias) # B, nh, Sq, Sk
 
-        att_probs = apply_attention((x_query, x_key), sinusoids, attention_bias) # B, nh, S, hd
+        #x_value = x_value.permute(0, 2, 1, 3) # B, S, nh, hs => B, nh, S, hs
 
-        x_value = x_value.permute(0, 2, 1, 3) # B, S, nh, hs => B, nh, S, hs
-
-        x = torch.matmul(att_probs, x_value)
-        x = x.permute(0, 2, 1, 3).contiguous()
+        x = torch.einsum('...hqk,...khd->...qhd', att_probs, x_value)
+        print_model(x, 'att_probs * Value')
+        #x = torch.matmul(att_probs, x_value) # B, nh, Sq, Sk * B, nh, Sv, hs
+        #x = x.permute(0, 2, 1, 3).contiguous() # B, Sv, nh, hs
         new_x_shape = x.size()[:-2] + (self.hidden_size,)
-        x = x.view(*new_x_shape)
+        x = x.reshape(*new_x_shape)
 
         x = self.attn_proj(x)
 
@@ -257,18 +272,18 @@ class TransformerLayer(nn.Module):
 
         assert hsz == self.hidden_size
 
-        x_ln = self.pre_attn_ln(x)
-        #print_model(x_ln, 'after_pre_attn_ln')
+        x_ln = self.pre_attn_ln(x) # B, S, H
+        print_model(x_ln, 'after_pre_attn_ln')
 
         x_attn = self.attention_layer(x_ln, sinusoids=sinusoids, attention_bias=attention_bias)
-        #print_model(x_attn, 'after_attention_layer')
+        print_model(x_attn, 'after_attention_layer')
 
         hidden = x_attn + x
         hidden_ln = self.pre_mlp_ln(hidden)
-        #print_model(hidden_ln, 'after_pre_mlp_ln')
+        print_model(hidden_ln, 'after_pre_mlp_ln')
 
         hidden_mlp = self.mlp_layer(hidden_ln)
-        #print_model(hidden_mlp, 'after_mlp_layer')
+        print_model(hidden_mlp, 'after_mlp_layer')
 
 
         hidden = hidden + hidden_mlp
@@ -322,7 +337,7 @@ class TransformerEncoder(nn.Module):
             if attention_mask is not None:
                 raise ValueError("Attention mask must not be provided if adding CLS token")
 
-            #print_model(self.cls, 'cls_token')
+            print_model(self.cls, 'cls_token')
             cls_token = torch.tile(self.cls, [batch_dims, 1, 1])
 
             x = torch.cat([cls_token.to(x.dtype), x], -2)
@@ -332,7 +347,7 @@ class TransformerEncoder(nn.Module):
             if rotary_coords is not None:
                 # CLS token is always 0's
                 rotary_coords = torch.cat([torch.zeros_like(rotary_coords[..., :1, :]), rotary_coords], -2)
-            #print_model(rotary_coords, 'rotary_coords')
+            print_model(rotary_coords, 'rotary_coords')
 
         # Optional rotary embeddings
         if rotary_coords is not None:
@@ -341,7 +356,7 @@ class TransformerEncoder(nn.Module):
             assert self.rotary_hsize is not None
             assert self.rotary_hsize <= self.size_per_head
             sinusoids = construct_rotary_sinusoids(rotary_coords, rotary_hsize=self.rotary_hsize)
-            #print_model(sinusoids, 'sinusoids')
+            print_model(sinusoids, 'sinusoids')
 
         else:
             sinusoids = None
@@ -351,7 +366,7 @@ class TransformerEncoder(nn.Module):
         elif (is_valid is not None) and (attention_mask is not None):
             raise ValueError("Provide only one of `is_valid` and `attention_mask` "
                              "as we can use is_valid to construct attention mask")
-        #print_model(attention_mask, 'attention_mask')
+        print_model(attention_mask, 'attention_mask')
 
         if attention_mask is not None: ## 문제 있을 수도 있음.
             # Broadcast attention mask to be over num head`s dimension
@@ -360,25 +375,68 @@ class TransformerEncoder(nn.Module):
             attention_bias = attention_bias.to(self.dtype)
         else:
             attention_bias = None
-        #print_model(attention_bias, 'attention_bias')
+        print_model(attention_bias, 'attention_bias')
 
         x = self.pre_ln(x)
-        #print_model(x, 'after pre_ln')
+        print_model(x, 'after pre_ln')
 
-        for layer_output in self.transformer_layers:
+        for layer_num, layer_output in enumerate(self.transformer_layers):
+            #print(f'--- {layer_num} ---')
             x = layer_output(x, sinusoids=sinusoids, attention_bias=attention_bias)
 
         x_ln = self.final_ln(x)
-        #print_model(x_ln, 'after final_ln')
+        print_model(x_ln, 'after final_ln')
 
         info = {}
         if self.add_cls_token:
             cls_vec = x_ln[..., 0, :]
             info['cls'] = self.cls_proj(cls_vec)
+            print_model(info['cls'], 'after_cls_proj')
+
             info['seq'] = x_ln[..., 1:, :]
+            print_model(info['seq'], 'info_seq' )
+
         else:
             info['seq'] = x_ln
         return info
+
+class SeqAttentionPool(nn.Module):
+    def __init__(self, hidden_size, num_heads, dtype):
+        super(SeqAttentionPool, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.dtype = dtype
+        self.size_per_head = self.hidden_size // self.num_heads
+        assert self.hidden_size == self.size_per_head * self.num_heads
+        self.query = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.key = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.value = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+        self.out = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
+
+    def transpose_for_scores(self, x):
+        new_x_shape = x.size()[:-1] + (self.num_heads, self.size_per_head)
+        x = x.view(*new_x_shape)
+        return x
+
+    def forward(self, query, key, value):
+        x_query = self.transpose_for_scores(self.query(query)) # [B, Seq, H_num, H_size]
+        x_key = self.transpose_for_scores(self.key(key)) # [B, Seq, H_num, H_size]
+        x_value = self.transpose_for_scores(self.value(value)) # [B, Seq, H_num, H_size]
+
+        x_query = x_query.permute(0, 2, 1, 3) # [B, H_num, Sq, H_size]
+        x_key = x_key.permute(0, 2, 3, 1) # [B, H_num, H_size, Sk]
+
+        #depth = x_query.shape[-1]
+        x_query = x_query / math.sqrt(self.size_per_head)
+        attn_weights = torch.matmul(x_query, x_key) # [B, H_num, Sq, Sk]
+        #attn_weights = query_key / math.sqrt(self.size_per_head) # [B, H_num, Sq, Sk]
+
+        att_probs = nn.functional.softmax(attn_weights, dim=-1) # [B, H_num, Sq, Sk]
+        attn_result = torch.einsum('...hqk,...khd->...qhd', att_probs, x_value)
+        new_shape = attn_result.size()[:-2] + (self.hidden_size,)
+        attn_result = attn_result.reshape(*new_shape)
+        attn_result = self.out(attn_result)
+        return attn_result
 
 
 class VisionTransformer(nn.Module):
@@ -400,8 +458,8 @@ class VisionTransformer(nn.Module):
         self.embedding = nn.Linear(self.hidden_size, self.hidden_size, dtype=self.dtype)
         self.transformer = TransformerEncoder(hidden_size=self.hidden_size, dtype=self.dtype,
                                    add_cls_token=True, num_layers=self.num_layers, size_per_head=self.size_per_head)
-        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
-
+        #self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
+        self.seq_attnpool = SeqAttentionPool(self.hidden_size, self.num_heads, self.dtype)
         if self.do_rotary:
             self.coords = get_rotary_coordinates_2d(
                 self.output_grid_h, self.output_grid_w, dtype=self.dtype)
@@ -421,10 +479,10 @@ class VisionTransformer(nn.Module):
 
         # i think no need to normalize here because pixel distributions are roughly the same
         x = self.embedding(x) # -- OK
-        #print_model(x, 'embedding')
+        print_model(x, 'embedding')
 
         if self.do_rotary:
-            #print_model(self.coords, 'coords')
+            print_model(self.coords, 'coords')
             coords = torch.tile(self.coords, [batch_dims, 1, 1])
         else:
             coords = None
@@ -434,21 +492,29 @@ class VisionTransformer(nn.Module):
         # Attention pool
         assert self.output_grid_h % self.pooling_ratio == 0
         assert self.output_grid_w % self.pooling_ratio == 0
-        h2 = self.output_grid_h // self.pooling_ratio
-        w2 = self.output_grid_w // self.pooling_ratio
-        b2 = int(np.prod([batch_dims, h2]))
+        h2 = self.output_grid_h // self.pooling_ratio # 18 // 2 = 9
+        w2 = self.output_grid_w // self.pooling_ratio # 18 // 2 = 9
+        b2 = int(np.prod([batch_dims, h2])) # 8 * 9 = 72
 
         seq = torch.reshape(t_out['seq'], [b2, self.pooling_ratio, w2, self.pooling_ratio, self.hidden_size])
-        seq = seq.swapaxes(-4, -3)
+        # t_out['seq'] : 8, 577, 768 -> [72, 2, 9, 2, 768]
+        seq = seq.swapaxes(-4, -3) # -> [72, 9, 2, 2, 768]
         seq = seq.reshape([b2 * w2, self.pooling_ratio ** 2, self.hidden_size])
+        print_model(seq, 'seq')
 
+        # [72 * 9, 4, 768]
         inputs_q = seq.mean(-2, keepdims=True)
+        print_model(inputs_q, 'inputs_q')
 
-        seq_attn_out, _  = self.seq_attnpool(inputs_q, seq, seq) ## 아마도 여기 문제 있을 수 있음.
+        # [72 * 9, 1, 768]
+        seq_attn_out = self.seq_attnpool(query=inputs_q, key=seq, value=seq) ## 아마도 여기 문제 있을 수 있음.
 
         seq_attnpool = seq_attn_out.reshape([batch_dims, h2*w2, self.hidden_size])
+        print_model(seq_attnpool, 'seq_attnpool')
 
         t_out['seq_attnpool'] = seq_attnpool
+
+
         return t_out
 
 
@@ -470,7 +536,8 @@ class AudioTransformer(nn.Module):
         self.transformer = TransformerEncoder(hidden_size=self.hidden_size, add_cls_token=True,
                               num_layers=self.num_layers, size_per_head=self.size_per_head, dtype=self.dtype)
 
-        self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
+        #self.seq_attnpool = nn.MultiheadAttention(self.hidden_size, self.num_heads, batch_first=True, dtype=self.dtype)
+        self.seq_attnpool = SeqAttentionPool(self.hidden_size, self.num_heads, self.dtype)
 
     def forward(self, x):
         """
@@ -499,6 +566,8 @@ class AudioTransformer(nn.Module):
         seq = torch.reshape(t_out['seq'], [-1, self.pooling_ratio, self.hidden_size])
 
         inputs_q = seq.mean(-2, keepdims=True)
+
+        # inputs_q = inputs_q  / math.sqrt(64)
 
         seq_attnpool, _  = self.seq_attnpool(inputs_q, seq, seq) ## 아마도 여기 문제 있을 수 있음.
 
@@ -618,18 +687,17 @@ def unit_normalize(x, dtype=torch.float32):
 class MerlotReserve(nn.Module):
     config: Dict = None
 
-    # @classmethod
-    # def from_config(cls, config, **kwargs):
-    #     my_config = deepcopy(config["model"])
-    #     my_config.update(config['data'])
-    #     my_config["dtype"] = torch.float32
-    #     return cls(config=my_config, **kwargs)
+    @classmethod
+    def from_config(cls, config, logger=None):
+        my_config = deepcopy(config["model"])
+        my_config.update(config['data'])
+        my_config["dtype"] = torch.float32
+        return cls(config=my_config, logger=logger)
     
-    def __init__(self, config, logger, device):
+    def __init__(self, config, logger):
         super().__init__()
         self.config = config
         self.logger = logger
-        self.device = device
         for k, v in self.config.items():
             setattr(self, k, v)
 
@@ -728,7 +796,11 @@ class MerlotReserve(nn.Module):
         if token_embs is None:
             token_embs = self.token_encoder({'k': tokens})['k']
 
-        if (audio_spans is not None) and (audio_pointers is not None):
+        if (audio_spans is None) or (audio_pointer is None):
+            audio_spans = audio_spans
+            # print("Not Including Audio Input !)
+        else:
+            ##  print('adding in audio input!')
             b_, num_audio_seqs, audio_token_length, h_ = audio_spans.shape
             assert b_ == B
             assert self.audio_token_length == audio_token_length
@@ -750,6 +822,7 @@ class MerlotReserve(nn.Module):
             segment_idx=token_segment_idx.to(self.dtype) if token_segment_idx is not None else None,
             token_idx=token_idx, dtype=self.dtype)
         coords = coords.to(self.device)
+
         if vision_input is not None:
 
             hpool = self.output_grid_h // self.vit_pooling_ratio
@@ -1115,24 +1188,44 @@ class PretrainedMerlotReserve:
         answer_table_enc = jnp.array([x.ids[:15] for x in self.encoder.encode_batch(options)])
         self.encoder.no_padding()
         return self.embed_text_spans_only(answer_table_enc)
-#
-# def #print_model(_param, name='none'):
-#     return
-#     start_str = f'---- {name} ----'
-#     print(start_str)
-#     try:
-#         if len(_param.shape) == 5:
-#             print(_param[0][0][0][0][:5], _param.shape)
-#         if len(_param.shape) == 4:
-#             print(_param[0][0][0][:5], _param.shape)
-#         elif len(_param.shape) == 3:
-#             print(_param[0][0][:5], _param.shape)
-#         elif len(_param.shape) == 2:
-#             print(_param[0][:5], _param.shape)
-#         elif len(_param.shape) == 1:
-#             print(_param[:5], _param.shape)
-#         else:
-#             print(_param, _param.shape)
-#     except:
-#         print(_param)
-#     print('=' * len(start_str))
+
+def print_model(_param, name='none'):
+    return
+    start_str = f'---- {name} ----'
+    print(start_str)
+    try:
+        if len(_param.shape) == 5:
+            print(_param[0][0][0][0][:5], _param.shape)
+            print(_param[0][0][0][1][:5], _param.shape)
+            print(_param[0][0][0][2][:5], _param.shape)
+            print(_param[0][0][0][3][:5], _param.shape)
+            print(_param[0][0][0][4][:5], _param.shape)
+            #print(_param[0][0][0][5][:5], _param.shape)
+        if len(_param.shape) == 4:
+            print(_param[0][0][0][:5], _param.shape)
+            print(_param[0][0][1][:5], _param.shape)
+            print(_param[0][0][2][:5], _param.shape)
+            print(_param[0][0][3][:5], _param.shape)
+            print(_param[0][0][4][:5], _param.shape)
+            #print(_param[0][0][5][:5], _param.shape)
+        elif len(_param.shape) == 3:
+            print(_param[0][0][:5], _param.shape)
+            print(_param[0][1][:5], _param.shape)
+            print(_param[0][2][:5], _param.shape)
+            print(_param[0][3][:5], _param.shape)
+            print(_param[0][4][:5], _param.shape)
+            #print(_param[0][5][:5], _param.shape)
+        elif len(_param.shape) == 2:
+            print(_param[0][:5], _param.shape)
+            print(_param[1][:5], _param.shape)
+            print(_param[2][:5], _param.shape)
+            print(_param[3][:5], _param.shape)
+            print(_param[4][:5], _param.shape)
+            #print(_param[5][:5], _param.shape)
+        elif len(_param.shape) == 1:
+            print(_param[:5], _param.shape)
+        else:
+            print(_param, _param.shape)
+    except:
+        print(_param)
+    print('=' * len(start_str))
