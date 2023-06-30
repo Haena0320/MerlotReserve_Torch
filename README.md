@@ -1,4 +1,4 @@
-# Dilab_MerlotReserve_Torch
+# MerlotReserve_Torch
 
 
 Merlot Reserve 를 PyTorch로 재구현하는 프로젝트입니다.
